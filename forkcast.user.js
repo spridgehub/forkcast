@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Forkcast Helper
 // @namespace    forkcast.spridge
-// @version      1.0.1792816684
+// @version      1.0.1792906678
 // @description  One-click trolley filling for Forkcast and Plates: fills your supermarket trolley in your own browser.
 // @match        https://ocado.com/*
 // @match        https://*.ocado.com/*
@@ -37,7 +37,7 @@
 // ==/UserScript==
 (() => {
   "use strict";
-  const VERSION = "1.0.1792816684";
+  const VERSION = "1.0.1792906678";
   const here = location.hostname;
   // on Forkcast / Plates: just say the helper is installed, so they offer the one-click button
   if (["100.122.51.100","192.168.1.178","localhost","127.0.0.1","spridge-bot.github.io"].includes(here)) { document.documentElement.dataset.fcHelper = VERSION; return; }
