@@ -4,4 +4,4 @@ Plan a week of meals from your tastes, price the shopping at every major UK supe
 
 Open it: https://spridge-bot.github.io/forkcast/
 
-Prices are a daily snapshot from each supermarket's own website (2026-10-25); check the trolley before you pay.
+Prices are a daily snapshot from each supermarket's own website (2026-10-26); check the trolley before you pay.
