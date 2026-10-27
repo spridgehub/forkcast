@@ -43,6 +43,8 @@ function fit(r, p) {
   if (g === "lower-calorie") s += r.kcal < 550 ? .8 : r.kcal > 750 ? -.8 : 0;
   if (g === "lower-carb") s += r.carbs_g < 35 ? .8 : r.carbs_g > 70 ? -.6 : 0;
   if (g === "more-veg") s += Math.min(1, r.fibre_g / 10);
+  // daily calorie and macro targets: meals that fit their share of the day, once the portion is set, come first
+  if (hasTargets(p)) s -= 6 * macroErr(r, r.meal, p);
   if (p.style === "value" || (p.budget && p.budget / Math.max(1, people(p)) < 25)) s += r.tags.includes("budget") ? .6 : 0;
   if (r.tags.includes("family") && (p.children || 0) > 0) s += .5;
   return s;
@@ -54,6 +56,29 @@ function avoids(r, a) {
   return r.ingredients.some(i => i.item === w || re.test(i.item)) || re.test(r.name.toLowerCase().replace(/[^a-z0-9 ]/g, " "));
 }
 const people = p => (+p.adults || 2) + .6 * (+p.children || 0);
+
+// --------------------------------------------------------------- targets --
+// p.targets = { kcal, protein_g, carbs_g, fat_g } per person per day (any can be 0 = no target).
+// Each meal aims at its share of the day; a day with only dinner planned aims dinner at 40%.
+const SHARE = { breakfast: .25, lunch: .35, dinner: .4 }, MACROS = ["kcal", "protein_g", "carbs_g", "fat_g"];
+const WEIGHT = { kcal: 1.5, protein_g: 1.2, carbs_g: .8, fat_g: .8 };
+const hasTargets = p => MACROS.some(k => +(p.targets || {})[k] > 0);
+// Portion size for a meal (1 = the recipe's own serving): scaled, within reason, to hit the calories.
+function portion(r, meal, p) {
+  const t = +(p.targets || {}).kcal;
+  if (!t || p.scalePortions === false || !r.kcal) return 1;
+  return Math.round(Math.min(1.5, Math.max(.75, t * SHARE[meal] / r.kcal)) * 20) / 20;
+}
+// How far a meal (at its portion) is from its share of the targets: 0 = spot on, 0.3 = 30% out on average.
+function macroErr(r, meal, p) {
+  const f = portion(r, meal, p);
+  let err = 0, w = 0;
+  for (const k of MACROS) {
+    const t = +(p.targets || {})[k] * SHARE[meal]; if (!(t > 0)) continue;
+    err += WEIGHT[k] * Math.min(1.5, Math.abs((r[k] || 0) * f - t) / t); w += WEIGHT[k];
+  }
+  return w ? err / w : 0;
+}
 
 // Pick `n` meals of `meal` type: best fits first, but spread cuisines and proteins, and favour
 // recipes that share fresh ingredients with ones already chosen (less waste, smaller basket).
@@ -121,7 +146,17 @@ function plan(recipes, p, seed = 1, keep = {}) {
     const prev = days[(s.i + 6) % 7].dinner;
     if (prev) { days[s.i].lunch = prev; days[s.i].lunchLeftovers = true; }
   }
+  setPortions({ days }, recipes, p);
   return { seed, days: days.filter(d => MEALS.some(m => d[m])) };
+}
+// day.portion = { dinner: 1.15, … } where a meal isn't the recipe's own serving (with calorie targets)
+function setPortions(planObj, recipes, p) {
+  const byId = Object.fromEntries(recipes.map(r => [r.id, r]));
+  for (const d of planObj.days) {
+    delete d.portion;
+    for (const m of MEALS) { const r = byId[d[m]], f = r ? portion(r, m, p) : 1; if (f !== 1) (d.portion || (d.portion = {}))[m] = f; }
+  }
+  return planObj;
 }
 // ---------------------------------------------------------- shopping list --
 // Every recipe serves `serves`; scale to the household (children count as ~0.6 of an adult).
@@ -130,7 +165,7 @@ function list(planObj, recipes, ingredients, p) {
   const who = people(p);
   for (const d of planObj.days) for (const slot of MEALS) {
     const r = byId[d[slot]]; if (!r) continue;
-    const k = who / (r.serves || 4);
+    const k = who * (d.portion?.[slot] || 1) / (r.serves || 4);
     for (const i of r.ingredients) {
       const c = ingredients[i.item]; if (!c) continue;
       const n = need[i.item] || (need[i.item] = { item: i.item, name: c.name, unit: c.unit, qty: 0, aisle: c.aisle, pantry: !!c.pantry, for: [] });
@@ -138,9 +173,34 @@ function list(planObj, recipes, ingredients, p) {
       if (!n.for.includes(r.name)) n.for.push(r.name);
     }
   }
-  const have = new Set(p.pantryHave || []);
-  return Object.values(need).map(n => ({ ...n, qty: Math.ceil(n.qty), skip: n.pantry && (p.pantryAll || have.has(n.item)) }))
-    .sort((a, b) => a.aisle < b.aisle ? -1 : a.aisle > b.aisle ? 1 : a.name < b.name ? -1 : 1);
+  // p.cupboard = { item: { qty } } what's already in: no qty means plenty, a qty comes off what's needed
+  const have = new Set(p.pantryHave || []), cup = p.cupboard || {};
+  return Object.values(need).map(n => {
+    const want = Math.ceil(n.qty), c = cup[n.item], got = c ? (c.qty == null ? want : Math.min(want, Math.floor(c.qty))) : 0;
+    return { ...n, need: want, have: got, qty: want - got, skip: (n.pantry && (p.pantryAll || have.has(n.item))) || want - got <= 0 };
+  }).sort((a, b) => a.aisle < b.aisle ? -1 : a.aisle > b.aisle ? 1 : a.name < b.name ? -1 : 1);
+}
+// What's left in the cupboard once this week's shop is in and the meals are cooked: amounts used
+// come off what was there, and the spare from long-life packs bought is added. Fresh food isn't kept.
+// lines: the chosen shop's basket lines ({ item, packs, product }); returns the new cupboard.
+function restock(cupboard, listLines, lines, ingredients) {
+  const out = JSON.parse(JSON.stringify(cupboard || {})), bought = Object.fromEntries((lines || []).filter(l => !l.missing).map(l => [l.item, l]));
+  const keeps = c => c && (!c.perishable || (c.shelfDays || 0) >= 30);
+  for (const l of listLines || []) {
+    const c = out[l.item];
+    if (c && c.qty != null && l.have) { c.qty -= l.have; if (c.qty <= 0) delete out[l.item]; }
+    const b = bought[l.item], cat = ingredients[l.item];
+    if (!b || l.skip || !keeps(cat)) continue;
+    if (parseSize(b.product.size, b.product.name, l.unit)?.perKg) continue;          // loose: weighed out, nothing spare
+    const y = packYield(b.product, l, cat);
+    const spare = y ? b.packs * y - l.qty : 0;
+    if (spare >= Math.max(1, l.qty * .1) || (spare > 0 && l.unit === "each")) {
+      const e = out[l.item] || (out[l.item] = { qty: 0, unit: l.unit, name: cat.name });
+      if (e.qty != null) e.qty = Math.round(e.qty + spare);
+      e.since = e.since || Date.now();
+    }
+  }
+  return out;
 }
 
 // ------------------------------------------------------ product matching --
@@ -318,14 +378,27 @@ function basket(list, results, ingredients, p, more = () => null) {
 const pickFields = (x, price) => ({ id: x.id, name: x.name, size: x.size, price: +(+price).toFixed(2), shelf: +x.price, tier: x.tier, promo: x.promo || "", url: x.url, image: x.image, unitPrice: x.unitPrice, unitLabel: x.unitLabel });
 
 // Nutrition for the week, per person per day, from the recipes (dinners + lunches chosen).
-function nutrition(planObj, recipes) {
+function nutrition(planObj, recipes, p = {}) {
   const byId = Object.fromEntries(recipes.map(r => [r.id, r])), t = { kcal: 0, protein_g: 0, carbs_g: 0, fat_g: 0, fibre_g: 0, salt_g: 0 };
   let meals = 0;
-  for (const d of planObj.days) for (const slot of MEALS) { const r = byId[d[slot]]; if (!r) continue; meals++; for (const k in t) t[k] += r[k] || 0; }
-  const days = 7;                                                                // averaged over the whole week
-  return { perDay: Object.fromEntries(Object.entries(t).map(([k, v]) => [k, Math.round(v / days)])), meals };
+  // and each day on its own, with the target for the meals planned that day (dinner only: 40% of the day)
+  const days = planObj.days.map(d => {
+    const day = { day: d.day, kcal: 0, protein_g: 0, carbs_g: 0, fat_g: 0, share: 0 };
+    for (const slot of MEALS) {
+      const r = byId[d[slot]]; if (!r) continue; meals++;
+      const f = d.portion?.[slot] || 1;
+      for (const k in t) t[k] += (r[k] || 0) * f;
+      for (const k of MACROS) day[k] += (r[k] || 0) * f;
+      day.share += SHARE[slot];
+    }
+    for (const k of MACROS) day[k] = Math.round(day[k]);
+    day.share = Math.round(day.share * 100) / 100;
+    if (hasTargets(p)) day.target = Object.fromEntries(MACROS.filter(k => +p.targets[k] > 0).map(k => [k, Math.round(p.targets[k] * day.share)]));
+    return day;
+  });
+  return { perDay: Object.fromEntries(Object.entries(t).map(([k, v]) => [k, Math.round(v / 7)])), meals, days };   // perDay: averaged over the whole week
 }
 
-const API = { PRESETS, MEALS, slots, fit, plan, list, parseSize, packYield, chooseLine, basket, nutrition, STYLES, DAYS, people };
+const API = { PRESETS, MEALS, slots, fit, plan, list, parseSize, packYield, chooseLine, basket, nutrition, restock, setPortions, portion, SHARE, STYLES, DAYS, people };
 if (typeof module !== "undefined" && module.exports) module.exports = API; else window.E = API;
 })();

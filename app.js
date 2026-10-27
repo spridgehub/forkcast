@@ -16,8 +16,8 @@ const PRICES = {}, LOCALJOBS = {};
 async function getJSON(u) { const r = await fetch(u, { cache: "no-cache" }); if (!r.ok) throw new Error(r.statusText); return r.json(); }
 async function localApi(path, body) {
   if (path === "/api/content") return getJSON("data/content.json");
-  if (path === "/api/plan") { const pl = E.plan(C.recipes, body.prefs, body.seed || 1, body.keep || {}); return { plan: pl, list: E.list(pl, C.recipes, C.ingredients, body.prefs), nutrition: E.nutrition(pl, C.recipes) }; }
-  if (path === "/api/list") return { list: E.list(body.plan, C.recipes, C.ingredients, body.prefs), nutrition: E.nutrition(body.plan, C.recipes) };
+  if (path === "/api/plan") { const pl = E.plan(C.recipes, body.prefs, body.seed || 1, body.keep || {}); return { plan: pl, list: E.list(pl, C.recipes, C.ingredients, body.prefs), nutrition: E.nutrition(pl, C.recipes, body.prefs) }; }
+  if (path === "/api/list") { const pl = E.setPortions(body.plan, C.recipes, body.prefs); return { plan: pl, list: E.list(pl, C.recipes, C.ingredients, body.prefs), nutrition: E.nutrition(pl, C.recipes, body.prefs) }; }
   if (path === "/api/compare") {
     const shops = await getJSON("data/retailers.json"), todo = body.list.filter(l => !l.skip), job = { id: "local" + Date.now(), total: todo.length, retailers: {}, finished: Date.now() };
     await Promise.all(shops.map(async r => {
@@ -47,6 +47,7 @@ function prefs() {
     spice: q("spice") ?? 2, weeknightTime: +q("weeknightTime") || 45, confidence: +q("confidence") || 2, kit: q("kit") || [], goal: q("goal") || "balanced",
     budget: +q("budget") || 0, style: q("style") || "auto", loyalty: q("loyalty") === true || q("loyalty") === "yes", variety: q("variety") || "variety",
     avoid: (q("avoid") || []).map(s => String(s).toLowerCase()), pantryHave: S.pantryHave || [], pantryAll: S.pantryAll ?? true,
+    targets: S.targets || {}, scalePortions: S.scalePortions ?? true, cupboard: cupActive(),
     favourites: S.favs || [], ratings: S.ratings || {}, recent: recentMeals(),
   };
 }
@@ -232,7 +233,7 @@ async function useWeek(i) {
   const keep = {}; S.plan.days.forEach(d => MEALS.forEach(m => { if (d[m] && !(m === "lunch" && d.lunchLeftovers)) keep[`${d.day}.${m}`] = d[m]; }));
   S.keep = keep;
   const r = await api("/api/list", { plan: S.plan, prefs: prefs() });
-  S.list = r.list; S.nutrition = r.nutrition; S.job = null; S.pick = null; S.swaps = {}; S.step = 1; save(); render(); scrollTo(0, 0);
+  S.plan = r.plan || S.plan; S.list = r.list; S.nutrition = r.nutrition; S.job = null; S.pick = null; S.swaps = {}; S.step = 1; save(); render(); scrollTo(0, 0);
 }
 function delWeek(i) { if (confirm(`Delete "${S.saved[i].name}"?`)) { S.saved.splice(i, 1); save(); render(); } }
 function favouritesHTML() {
@@ -245,6 +246,58 @@ function favouritesHTML() {
   return h;
 }
 const ESSENTIAL = ["adults", "children", "diet", "mustBe", "allergies"];
+
+// ---------------------------------------------------------------- calorie and macro targets
+// Per person per day. The planner picks meals that fit each one's share of the day and (unless
+// turned off) sizes the portions to land on the calories; the shopping list follows the portions.
+const TARGETS = [["kcal", "Calories", "kcal", 50], ["protein_g", "Protein", "g", 5], ["carbs_g", "Carbs", "g", 5], ["fat_g", "Fat", "g", 5]];
+// share of the calories from protein, carbs and fat (4, 4 and 9 kcal a gram)
+const SPLITS = { balanced: ["Balanced", .3, .4, .3], "high-protein": ["High protein", .4, .3, .3], "lower-carb": ["Lower carb", .35, .2, .45] };
+function targetsHTML() {
+  const t = S.targets || {};
+  return panel("Calories & macros", "optional · per person, per day", `<div class="inline-q targets">${TARGETS.map(([k, l, u, st]) => `<label>${l} <input type="number" inputmode="numeric" min="0" step="${st}" value="${t[k] || ""}" placeholder="–" onchange="setTarget('${k}',this.value)"><span class="dim small">${u}</span></label>`).join("")}</div>
+    ${t.kcal ? `<div class="chips" style="margin-top:12px"><span class="small dim" style="align-self:center">Macros from your calories:</span>${Object.entries(SPLITS).map(([k, [l]]) => `<button class="chip" onclick="splitMacros('${k}')">${l}</button>`).join("")}</div>` : ""}
+    <label class="row small" style="margin-top:12px"><input type="checkbox" ${S.scalePortions ?? true ? "checked" : ""} onchange="S.scalePortions=this.checked;save();S.plan?relist():render()"> Size the portions to hit the calories (the shopping list follows)</label>
+    <p class="small dim" style="margin:8px 0 0">Breakfast aims at a quarter of the day, lunch about a third and dinner the rest; meals you don't plan are left for you.</p>`);
+}
+function setTarget(k, v) { const t = { ...(S.targets || {}) }; +v > 0 ? t[k] = Math.round(+v) : delete t[k]; S.targets = t; save(); S.plan ? relist() : render(); }
+function splitMacros(k) { const [, p, c, f] = SPLITS[k], kcal = S.targets.kcal;
+  S.targets = { kcal, protein_g: Math.round(kcal * p / 4), carbs_g: Math.round(kcal * c / 4), fat_g: Math.round(kcal * f / 9) }; save(); S.plan ? relist() : render(); }
+
+// ---------------------------------------------------------------- the cupboard
+// What's already in, so it isn't bought again: { item: { qty, unit, name, until } }. No qty means
+// plenty; a qty comes off what the week needs. Long-life things stay until they run out or the amount
+// is used up; fresh things you say you have count for that week only (until its Sunday).
+const cupActive = () => Object.fromEntries(Object.entries(S.cupboard || {}).filter(([, c]) => !c.until || c.until >= S.week));
+const keepsLong = item => { const c = C.ingredients[item]; return !!c && (!c.perishable || (c.shelfDays || 0) >= 30); };
+const cupEntry = k => { const c = C.ingredients[k] || {}; return { unit: c.unit, name: c.name || k, since: Date.now(), ...(keepsLong(k) ? {} : { until: addDays(S.week, 6) }) }; };
+function setCupboard(cup) { S.cupboard = cup; save(); S.plan ? relist() : render(); }
+function toggleHave(item) { const cup = { ...(S.cupboard || {}) }; cupActive()[item] ? delete cup[item] : cup[item] = cupEntry(item); setCupboard(cup); }
+function addCup(name) {
+  const k = Object.keys(C.ingredients).find(k => C.ingredients[k].name.toLowerCase() === String(name).trim().toLowerCase());
+  if (k) setCupboard({ ...(S.cupboard || {}), [k]: cupEntry(k) });
+}
+function setCup(k, v) { const c = { ...S.cupboard[k] }; v === "" ? delete c.qty : c.qty = Math.max(0, +v); setCupboard({ ...S.cupboard, [k]: c }); }
+function ranOut(k) { const cup = { ...(S.cupboard || {}) }; delete cup[k]; setCupboard(cup); }
+function cupboardHTML() {
+  const cup = cupActive(), ks = Object.keys(cup).sort((a, b) => (cup[a].name || a).localeCompare(cup[b].name || b));
+  const opts = Object.keys(C.ingredients).filter(k => !cup[k]).map(k => C.ingredients[k].name).sort().map(n => `<option value="${esc(n)}">`).join("");
+  const rows = ks.map(k => { const c = cup[k], u = c.unit || C.ingredients[k]?.unit;
+    return `<div class="li cup"><span style="flex:1">${esc(c.name || k)}${c.until ? ` <span class="small dim">· this week</span>` : ""}</span>
+      <input type="number" inputmode="numeric" min="0" step="${u === "each" ? 1 : 10}" value="${c.qty ?? ""}" placeholder="plenty" aria-label="How much ${esc(c.name || k)}" onchange="setCup('${esc(k)}',this.value)"><span class="small dim u">${u === "each" ? "×" : esc(u || "")}</span>
+      <button class="tiny" onclick="ranOut('${esc(k)}')">Ran out</button></div>`; }).join("");
+  return fold("Your cupboard", ks.length ? `${ks.length} item${ks.length > 1 ? "s" : ""} · not bought again` : "what you've already got",
+    `<p class="small dim" style="margin:0 0 8px">Anything here comes off the shopping list. Leave the amount blank for plenty. When you order, Forkcast adds what's left of long-life packs (rice, pasta, tins) so it isn't bought again.</p>${rows}
+    <div class="row" style="margin-top:10px"><input list="cup-ings" placeholder="Add something you've got…" aria-label="Add something you've got" style="flex:1" onchange="addCup(this.value)"><datalist id="cup-ings">${opts}</datalist></div>`, ks.length > 0 && WIDE);
+}
+// After ordering: take this week's cooking out of the cupboard and put the long-life spare in
+function markOrdered(id) {
+  const r = S.job.retailers[id], v = shopView(r), before = cupActive();
+  S.cupboard = E.restock(Object.fromEntries(Object.entries(S.cupboard || {}).filter(([, c]) => !c.until || c.until >= S.week)), S.list, v.lines, C.ingredients);
+  const kept = Object.keys(S.cupboard).filter(k => !before[k] || (S.cupboard[k].qty ?? 0) > (before[k].qty ?? 0)).length;
+  S.weeks[S.week] = { ...(S.weeks[S.week] || {}), ordered: { at: Date.now(), shop: r.name, kept } };
+  save(); render();
+}
 function tastes() {
   const Q = id => C.questionnaire.find(q => q.id === id), rest = C.questionnaire.filter(q => ![...ESSENTIAL, "dinners", "lunches", "meals"].includes(q.id));
   const p = prefs();
@@ -254,8 +307,8 @@ function tastes() {
     + weekBar()
     + (WIDE
       ? cols(panel("Meals", "", mealsHTML()) + fold("More about what you like", "optional · cuisines, spice, time, budget…", rest.map(q => question(refine(q))).join(""), true),
-          whoPanel(who, Q) + historyHTML() + favouritesHTML())
-      : panel("Meals", "", mealsHTML()) + whoPanel(who, Q)
+          whoPanel(who, Q) + targetsHTML() + cupboardHTML() + historyHTML() + favouritesHTML())
+      : panel("Meals", "", mealsHTML()) + whoPanel(who, Q) + targetsHTML() + cupboardHTML()
         + fold("More about what you like", "optional · cuisines, spice, time, budget…", rest.map(q => question(refine(q))).join(""))
         + historyHTML() + favouritesHTML())
     + nextBar(matchLine(), S.plan ? "Re-plan my week" : "Plan my week", "buildWeek()");
@@ -280,20 +333,41 @@ async function buildWeek(keep = {}, seed) {
 function week() {
   const p = prefs(), n = S.nutrition?.perDay || {}, keep = S.keep || {};
   const days = S.plan.days.map(d => `<div class="day"><span class="d">${d.day}<span class="dt">${fmtD(addDays(S.week, DAYS.indexOf(d.day)), { day: "numeric", month: "short" })}</span></span><div>${MEALS.filter(m => d[m]).map(m => { const r = RECIPES[d[m]]; if (!r) return "";
-      const k = `${d.day}.${m}`, left = m === "lunch" && d.lunchLeftovers, pin = keep[k] === d[m];
-      return `<div class="meal"><span class="t"><span class="mt">${m}${left ? " · leftovers" : ""}</span><span class="n">${esc(r.name)}</span><span class="m">${left ? "from last night" : `${r.time} min · ${r.kcal} kcal`}</span></span>
+      const k = `${d.day}.${m}`, left = m === "lunch" && d.lunchLeftovers, pin = keep[k] === d[m], f = d.portion?.[m] || 1;
+      const size = f === 1 ? "" : ` · ${f > 1 ? "bigger" : "smaller"} portion (${f}×)`;
+      return `<div class="meal"><span class="t"><span class="mt">${m}${left ? " · leftovers" : ""}</span><span class="n">${esc(r.name)}</span><span class="m">${left ? `from last night · ${Math.round(r.kcal * f)} kcal` : `${r.time} min · ${Math.round(r.kcal * f)} kcal`}${size}</span></span>
         ${left ? "" : `${heart(d[m])}<button class="ico" aria-pressed="${pin}" title="${pin ? "Kept" : "Keep this one"}" aria-label="Keep" onclick="pinMeal('${k}','${d[m]}')">${pin ? "●" : "○"}</button><button class="ico" title="Swap for something else" aria-label="Swap" onclick="swapMeal('${k}')">↻</button>`}</div>`; }).join("")}</div></div>`).join("");
-  const L = S.list || [], buy = L.filter(l => !l.skip);
+  const L = S.list || [], buy = L.filter(l => !l.skip), cup = cupActive(), fromCup = L.filter(l => l.have > 0).length;
   let aisle = "";
   const listBody = `<label class="row small" style="margin-bottom:6px"><input type="checkbox" ${S.pantryAll ?? true ? "checked" : ""} onchange="S.pantryAll=this.checked;relist()"> I already have the store-cupboard basics (oil, salt, spices)</label>`
     + L.map(l => { const a = l.aisle !== aisle ? `<div class="aisle">${esc((aisle = l.aisle).replace(/-/g, " "))}</div>` : "";
-      return a + `<div class="li ${l.skip ? "skip-it" : ""}"><span class="qty num">${fmtQty(l.qty, l.unit)}</span><span style="flex:1">${esc(l.name)}</span>${l.pantry ? `<button class="tiny" onclick="togglePantry('${esc(l.item)}')">${l.skip ? "Need it" : "Have it"}</button>` : ""}</div>`; }).join("");
+      // store-cupboard basics keep their own switch; anything else goes in (or out of) your cupboard
+      const act = l.pantry && !cup[l.item] ? "togglePantry" : "toggleHave", part = l.have > 0 && !l.skip ? `<span class="small dim"> · have ${fmtQty(l.have, l.unit)}</span>` : "";
+      return a + `<div class="li ${l.skip ? "skip-it" : ""}"><span class="qty num">${fmtQty(l.skip ? l.need ?? l.qty : l.qty, l.unit)}</span><span style="flex:1">${esc(l.name)}${part}</span><button class="tiny" onclick="${act}('${esc(l.item)}')" aria-label="${l.skip ? "Need" : "Have"} ${esc(l.name)}">${l.skip ? "Need it" : "Have it"}</button></div>`; }).join("");
   return head("Step 2", "Your", "week.", "") + weekBar()
     + panel("", "", `<div class="row wrap" style="justify-content:space-between;margin-bottom:14px"><span class="small dim">${p.adults} adult${p.adults > 1 ? "s" : ""}${p.children ? ` + ${p.children} child${p.children > 1 ? "ren" : ""}` : ""} · ● keep · ↻ swap · ♡ favourite</span>
         <span class="row" style="gap:6px"><button class="tiny" onclick="reshuffle()">Reshuffle</button><button class="tiny" onclick="saveWeek()">Save week</button></span></div><div class="weekgrid">` + days + `</div>`)
+    + (S.targets && Object.keys(S.targets).length ? targetDaysHTML(S.nutrition) : "")
     + `<div class="pair">` + panel("", "", `<div class="nutri"><span><b>${n.kcal ?? "–"}</b>kcal</span><span><b>${n.protein_g ?? "–"}</b>g protein</span><span><b>${n.carbs_g ?? "–"}</b>g carbs</span><span><b>${n.fibre_g ?? "–"}</b>g fibre</span><span><b>${n.salt_g ?? "–"}</b>g salt</span></div><p class="small dim" style="margin:8px 0 0">Per person per day from these meals, averaged over the week.</p>`)
-    + fold("Shopping list", `${buy.length} items`, `<div class="listcols">${listBody}</div>`, WIDE) + `</div>`
+    + fold("Shopping list", `${buy.length} items${fromCup ? ` · ${fromCup} from your cupboard` : ""}`, `<div class="listcols">${listBody}</div>`, WIDE) + `</div>`
     + nextBar(`<b>${buy.length}</b> items to buy`, "Find the best shop", "startCompare()", !buy.length);
+}
+// Each day against its targets: the share of the day for the meals planned (dinner only: 40%)
+function targetDaysHTML(N) {
+  const T = S.targets || {}, ks = [["kcal", "Calories", ""], ["protein_g", "Protein", "g"], ["carbs_g", "Carbs", "g"], ["fat_g", "Fat", "g"]].filter(([k]) => T[k] > 0);
+  const days = (N?.days || []).filter(d => d.share > 0);
+  if (!ks.length || !days.length) return "";
+  const cell = (d, k, u) => { const t = d.target?.[k], v = d[k], off = t ? Math.abs(v / t - 1) : 0;
+    return `<td class="${!t ? "" : off <= .1 ? "ok" : off <= .2 ? "near" : "off"}"><b class="num">${v.toLocaleString("en-GB")}${u}</b><span class="dim">of ${(t || 0).toLocaleString("en-GB")}${u}</span></td>`; };
+  const onKcal = T.kcal ? days.filter(d => d.target?.kcal && Math.abs(d.kcal / d.target.kcal - 1) <= .1).length : null;
+  // the recipes can only do so much: say plainly what's short on average, and how to top it up
+  const short = ks.filter(([k]) => k !== "kcal").map(([k, l]) => { const t = days.reduce((a, d) => a + (d.target?.[k] || 0), 0), v = days.reduce((a, d) => a + d[k], 0);
+    return t && v / t < .85 ? `${l.toLowerCase()} by about ${Math.round((t - v) / days.length)} g a day` : ""; }).filter(Boolean);
+  const tip = short.length ? `<p class="notice">These meals fall short on ${short.join(" and ")}.${short.some(x => x.startsWith("protein")) ? " A high-protein snack (Greek yoghurt, eggs, a shake) closes the gap, or pick the high-protein goal under More about what you like." : ""}</p>` : "";
+  return panel("Your targets", onKcal == null ? "per person" : `${onKcal} of ${days.length} days within 10% on calories`,
+    `<div class="tgt-wrap"><table class="tgt"><thead><tr><th>Day</th>${ks.map(([, l]) => `<th>${l}</th>`).join("")}</tr></thead><tbody>${days.map(d =>
+      `<tr><th>${d.day}${d.share < 1 ? `<span class="dim">${Math.round(d.share * 100)}% of day</span>` : ""}</th>${ks.map(([k, , u]) => cell(d, k, u)).join("")}</tr>`).join("")}</tbody></table></div>
+    ${tip}<p class="small dim" style="margin:8px 0 0">Per person, for the meals planned each day (a % shows the share of the day they cover). <span class="tg-key ok">within 10%</span> <span class="tg-key near">within 20%</span> <span class="tg-key off">further out</span></p>`);
 }
 function pinMeal(k, id) { const kp = { ...(S.keep || {}) }; kp[k] === id ? delete kp[k] : kp[k] = id; S.keep = kp; save(); render(); }
 function reshuffle() { buildWeek(S.keep || {}, (S.seed || 1) + 1); }
@@ -308,7 +382,7 @@ const fmtQty = (q, u) => u === "each" ? `${q} ×` : u === "g" && q >= 1000 ? `${
 function togglePantry(item) { const have = new Set(S.pantryHave || []); const l = S.list.find(x => x.item === item);
   if (S.pantryAll ?? true) { S.pantryAll = false; S.list.filter(x => x.pantry && x.skip).forEach(x => have.add(x.item)); }
   l.skip ? have.delete(item) : have.add(item); S.pantryHave = [...have]; relist(); }
-async function relist() { const r = await api("/api/list", { plan: S.plan, prefs: prefs() }); S.list = r.list; S.job = null; S.pick = null; save(); render(); }
+async function relist() { const r = await api("/api/list", { plan: S.plan, prefs: prefs() }); S.plan = r.plan || S.plan; S.list = r.list; S.nutrition = r.nutrition; S.job = null; S.pick = null; save(); render(); }
 
 // ---------------------------------------------------------------- 3. shop
 async function startCompare() {
@@ -460,6 +534,9 @@ function orderPanel(r, v) {
     if (/unverified/.test(r.fillStatus)) h += `<p class="notice">Filling a ${esc(r.name)} basket is new and only partly tested. If anything's missing, the full list is below.</p>`;
   }
   h += fold("Products", `${buy.length} · ${money(v.total)}${v.missing ? ` · ${v.missing} not stocked` : ""}`, products + `<div class="row" style="margin-top:10px"><button class="tiny" onclick="copyList('${r.id}')">Copy as text</button></div>`);
+  const done = S.weeks?.[S.week]?.ordered;
+  h += done ? `<p class="small dim" style="margin-top:14px">✓ Ordered from ${esc(done.shop)}.${done.kept ? ` ${done.kept} long-life leftover${done.kept > 1 ? "s" : ""} went in your cupboard, so ${done.kept > 1 ? "they" : "it"} won't be bought again.` : ""}</p>`
+    : `<div class="stepline"><span class="n">✓</span><div class="b"><button onclick="markOrdered('${r.id}')">I've ordered this</button><p class="small dim">Forkcast keeps what's left of long-life packs (rice, pasta, tins…) in your cupboard, so next week's list doesn't buy them again.</p></div></div>`;
   return h + `</div>`;
 }
 // The bookmark is the one thing every browser has built in that can act on a supermarket's own page.
@@ -496,9 +573,9 @@ function recipes() {
     const r = RECIPES[d[slot]]; if (!r || (slot === "lunch" && d.lunchLeftovers)) continue;
     const nextDay = S.plan.days.find(x => x.day === DAYS[(DAYS.indexOf(d.day) + 1) % 7]);
     const double = slot === "dinner" && nextDay?.lunchLeftovers && nextDay.lunch === d.dinner;
-    const k = who * (double ? 2 : 1) / (r.serves || 4);
+    const f = d.portion?.[slot] || 1, f2 = double ? nextDay.portion?.lunch || 1 : 0, k = who * (f + f2) / (r.serves || 4);
     h += fold(`<span style="color:var(--tom-ink);font:700 15px/1 var(--font-head);letter-spacing:.08em;text-transform:uppercase;min-width:92px">${d.day} ${fmtD(addDays(S.week, DAYS.indexOf(d.day)), { day: "numeric" })} ${slot === "dinner" ? "" : slot}</span>${esc(r.name)}`, `${r.time} min`,
-      `<div class="row" style="justify-content:space-between;margin-bottom:6px"><p class="recipe meta" style="margin:0">${r.kcal} kcal · ${r.protein_g} g protein · serves ${Math.round(who * (double ? 2 : 1) * 10) / 10}${double ? ` · <span style="color:var(--tom-ink)">makes double: half is ${esc(nextDay.day)}'s lunch</span>` : ""}</p><span class="row" style="gap:2px">${starsHTML(r.id)}${heart(r.id)}</span></div>
+      `<div class="row" style="justify-content:space-between;margin-bottom:6px"><p class="recipe meta" style="margin:0">${Math.round(r.kcal * f)} kcal · ${Math.round(r.protein_g * f)} g protein · serves ${Math.round(who * (double ? 2 : 1) * 10) / 10}${f !== 1 ? ` · ${f}× portions` : ""}${double ? ` · <span style="color:var(--tom-ink)">makes double: half is ${esc(nextDay.day)}'s lunch</span>` : ""}</p><span class="row" style="gap:2px">${starsHTML(r.id)}${heart(r.id)}</span></div>
       <div class="two"><ul class="ing">${r.ingredients.map(i => `<li><span class="num">${fmtQty(Math.ceil(i.qty * k), i.unit)}</span><span>${esc((C.ingredients[i.item] || {}).name || i.item)}${i.note ? ` <span class="dim small">${esc(i.note)}</span>` : ""}</span></li>`).join("")}</ul>
       <ol class="steps-list">${r.steps.map(s => `<li>${esc(s)}</li>`).join("")}</ol></div>`);
   }

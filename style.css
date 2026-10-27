@@ -164,6 +164,24 @@ details.fold>.in{padding:0 20px 20px}
 .ico[aria-pressed="true"]{color:var(--tom-ink)}
 .nutri{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:14px;color:var(--ink-2)}
 .nutri b{font:700 20px/1 var(--font-head);color:var(--ink-1);margin-right:3px}
+/* targets: inputs, and each day against them */
+.targets{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 16px}
+.targets label{display:grid;grid-template-columns:1fr auto;align-items:center;gap:4px 8px}
+.targets label input{grid-column:1;grid-row:2;width:100%;min-width:0}
+.targets label span{grid-column:2;grid-row:2}
+.tgt-wrap{overflow-x:auto;margin:0 -4px}
+.tgt{width:100%;border-collapse:collapse;font-size:13px}
+.tgt th,.tgt td{padding:7px 4px;text-align:left;border-top:1px solid var(--line);white-space:nowrap}
+.tgt thead th{border-top:0;font:700 12px/1 var(--font-head);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3)}
+.tgt tbody th{font-weight:600}
+.tgt td b{font-weight:650}
+.tgt td.ok b,.tg-key.ok{color:var(--ok)} .tgt td.near b,.tg-key.near{color:var(--warn)} .tgt td.off b,.tg-key.off{color:var(--bad)}
+.tg-key{margin-left:8px;white-space:nowrap}
+.tg-key::before{content:"● "}
+/* the cupboard */
+.li.cup{align-items:center}
+.li.cup input{width:84px;min-height:34px;padding:6px 8px}
+.li.cup .u{min-width:28px}
 
 /* list */
 .aisle{font:700 13px/1 var(--font-head);letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);margin:16px 0 4px}
@@ -326,3 +344,4 @@ button.link{white-space:normal;text-align:left}
 
 .hm thead th span em{font-style:normal;color:var(--ink-4);font-size:10px}
 .hm-c{font-size:11.5px}
+.tgt td span,.tgt tbody th span{display:block;font-size:11px;font-weight:400}
